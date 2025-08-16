@@ -1,0 +1,189 @@
+###############################################################
+# RNA-Seq Analysis & lncRNA Prediction Pipeline
+# This script covers: Downloading reads, alignment, assembly,
+# lncRNA identification, quantification, DE analysis, and TPM/FPKM calculation
+###############################################################
+
+###############################
+# 1. Download SRA datasets
+###############################
+prefetch SRR10298424 SRR10294187 SRR10294188 SRR9702050 SRR9702051 SRR9702052
+
+###############################
+# 2. Build HISAT2 genome index
+###############################
+hisat2-build -p 8 genome.fasta genome_index
+
+###############################
+# 3. Align reads with HISAT2
+# Use paired-end (-1/-2) or single-end (-U) depending on dataset
+###############################
+hisat2 -p 16 -x ../index/index -1 reads_1.fastq -2 reads_2.fastq -S output_PE.sam
+hisat2 -p 16 -x ../index/index -U reads.fastq -S output_SE.sam
+
+###############################
+# 4. Convert SAM to sorted BAM
+###############################
+samtools view -Sb output_PE.sam | samtools sort -o sample_PE_sorted.bam
+samtools view -Sb output_SE.sam | samtools sort -o sample_SE_sorted.bam
+
+###############################
+# 5. Count reads per gene/transcript using featureCounts
+###############################
+# For single-end reads
+featureCounts -a lnc.gtf -o counts_SE.txt sample4_SE.bam sample5_SE.bam sample6_SE.bam
+
+# For paired-end reads
+featureCounts -p -a lnc.gtf -o counts_PE.txt sample1_PE.bam sample2_PE.bam sample3_PE.bam
+
+###############################
+# 6. Assemble transcripts with StringTie
+###############################
+# Assemble for each sample
+stringtie sample_PE_sorted.bam -G ../genome/A.gtf -o sample.gtf
+
+# Merge multiple assemblies into a single GTF
+stringtie --merge -G genome/A.gtf -o merged_transcripts.gtf SRR5313806/sample.gtf SRR5313807/sample.gtf SRR5313808/sample.gtf SRR5313809/sample.gtf SRR5313810/sample.gtf SRR5313811/sample.gtf
+
+# Estimate expression (TPM/FPKM) per transcript
+stringtie sample_sorted.bam -e -G ../genome/AT_TAIR10.gtf -A Output/tpm.txt
+
+###############################
+# 7. Optional: Split fastq for downstream analysis
+###############################
+fastq-dump-orig --split-3
+
+###############################
+# 8. Compare assembled transcripts to reference using gffcompare
+###############################
+gffcompare -r genome/TAIR10.gtf -G -o gffcompare/merged merged_transcripts.gtf
+# Output highlights matched, novel, or overlapping transcripts
+
+###############################
+# 9. lncRNA identification with FEELnc
+###############################
+# Set environment variables for FEELnc
+export FEELNCPATH=${PWD}
+export PERL5LIB=$PERL5LIB:${FEELNCPATH}/lib/
+export PATH=$PATH:${FEELNCPATH}/scripts/
+export PATH=$PATH:${FEELNCPATH}/utils/
+export PATH=$PATH:${FEELNCPATH}/bin/LINUX/
+
+# Filter transcripts for candidate lncRNAs
+FEELnc_filter.pl -i merged_transcripts.gtf -a genome/TAIR10.gtf -b transcript_biotype=protein_coding > candidate_lncRNA.gtf
+
+# Predict coding potential
+FEELnc_codpot.pl -i candidate_lncRNA.gtf -a ../genome/TAIR10.gtf -g ../genome/TAIR10.fa --mode=intergenic
+
+# Classify lncRNAs into types
+FEELnc_classifier.pl -i feelnc_codpot_out/candidate_lncRNA.gtf.lncRNA.gtf -a ../genome/TAIR10.gtf > lncRNA_classes.txt
+
+# Extract sequences of candidate lncRNAs
+gffread candidate_lncRNA.gtf -g AT_TAIR10.fa -w candidate_lncRNA.fa
+
+# Optional: Remove annotated transcripts
+seqkit grep -v -f <(cut -f 1 annotated_lncRNA_blastx.txt) candidate_lncRNA.fa > unannotated_transcripts_lncRNA.fa
+
+###############################
+# 10. Quantify transcripts with featureCounts
+###############################
+# Single-end
+featureCounts -a annotation.gtf -o transcript_counts_SE.txt -T 30 -t exon -g transcript_id sample_SE_sorted.bam
+
+# Paired-end
+featureCounts -a annotation.gtf -o transcript_counts_PE.txt -T 30 -p -t exon -g transcript_id -s 0 sample_PE_sorted.bam
+
+# Combine counts
+paste counts_PE.txt counts_SE.txt > combined_counts.txt
+
+###############################
+# 11. Differential Expression Analysis with DESeq2 (R)
+###############################
+# Install DESeq2 if not installed
+# install.packages("BiocManager")
+# BiocManager::install("DESeq2")
+library(DESeq2)
+
+# Load counts and metadata
+counts <- read.table("count.txt", header=TRUE, row.names=1, sep="\t")
+metadata <- read.table("metadata.txt", header=TRUE, row.names=1, sep="\t")
+
+# Create DESeq dataset
+dds <- DESeqDataSetFromMatrix(countData=counts, colData=metadata, design=~condition)
+
+# Run DE analysis
+dds <- DESeq(dds)
+res <- results(dds)
+
+# Save all results
+write.csv(as.data.frame(res), "DEG_results.csv")
+
+# Filter significant lncRNAs (padj < 0.05 & |log2FC| > 1)
+resSig <- res[which(res$padj < 0.05 & (res$log2FoldChange > 1 | res$log2FoldChange < -1)), ]
+write.csv(as.data.frame(resSig), "Significant_lncRNAs.csv")
+
+###############################
+# 12. lncRNA-mRNA Correlation Analysis (R)
+###############################
+library(stats)
+
+# Load expression data
+lncrna_expr <- read.csv("lncRNA_expression.csv", row.names = 1)
+mrna_expr <- read.csv("mRNA_expression.csv", row.names = 1)
+
+# Align samples
+lncrna_expr <- lncrna_expr[, colnames(mrna_expr)]
+
+# Initialize results
+results <- data.frame(lncRNA = character(),
+                      mRNA = character(),
+                      Correlation = numeric(),
+                      P_value = numeric(),
+                      stringsAsFactors = FALSE)
+
+# Compute correlations
+for (lncRNA in rownames(lncrna_expr)) {
+  for (mRNA in rownames(mrna_expr)) {
+    cor_test <- cor.test(as.numeric(lncrna_expr[lncRNA, ]), as.numeric(mrna_expr[mRNA, ]))
+    if (cor_test$p.value < 0.05) {
+      results <- rbind(results, data.frame(
+        lncRNA = lncRNA,
+        mRNA = mRNA,
+        Correlation = cor_test$estimate,
+        P_value = cor_test$p.value
+      ))
+    }
+  }
+}
+
+# Save correlation results
+write.csv(results, "lncRNA_mRNA_correlations.csv", row.names = FALSE)
+cat("Correlation results saved to 'lncRNA_mRNA_correlations.csv'.\n")
+
+###############################
+# 13. Calculate FPKM and TPM (R)
+###############################
+# Load counts and gene lengths
+counts <- read.table("count.txt", header = TRUE, row.names = 1)
+gene_lengths <- read.table("length.txt", header = TRUE, row.names = 1)
+
+# Ensure gene lengths match counts
+gene_lengths <- gene_lengths[rownames(counts), , drop = FALSE]
+
+# Calculate RPK (Reads per Kilobase)
+rpk <- counts / (gene_lengths$Length / 1000)
+
+# FPKM calculation
+scaling_factors_fpkm <- colSums(counts) / 1e6
+fpkm <- t(t(rpk) / scaling_factors_fpkm)
+
+# TPM calculation
+scaling_factors_tpm <- colSums(rpk)
+tpm <- t(t(rpk) / scaling_factors_tpm * 1e6)
+
+# Combine counts, FPKM, TPM
+combined <- cbind(Counts = counts, FPKM = fpkm, TPM = tpm)
+
+# Save to file
+write.table(combined, "count_fpkm_tpm.txt", sep = "\t", quote = FALSE, col.names = NA)
+print(combined)

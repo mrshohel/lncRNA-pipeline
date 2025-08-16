@@ -1,0 +1,11 @@
+blastx -query unannotated_transcripts_lncRNA.fa -db /home/li/public2/nuomi/ref/nr/nr -strand plus -out predicted_lncRNA_drought_blastx.txt -evalue 1E-10 -outfmt 6 -num_threads 24
+
+
+
+Kindly enter following commands in your server system:
+
+1. change your directory to result subfolder of Drought folder. for that use following command in server.
+cd ~/Drought/lncrna/result/
+
+2. Now type following command:
+blastx -query unannotated_transcripts_lncRNA.fa -db /home/li/public2/nuomi/ref/nr/nr -strand plus -out predicted_lncRNA_drought_blastx.txt -evalue 1E-10 -outfmt 6 -num_threads 24
